@@ -1,0 +1,8 @@
+{
+  "Parameters" : {
+    "TagKey": "Name",
+    "TagValue": "DemoSampleTomcatTest",
+    "KeyPairName": "test_key",
+    "InstanceCount": "2"
+  }
+}

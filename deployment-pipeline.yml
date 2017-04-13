@@ -1,0 +1,562 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  AWS CloudFormation Continuous Delievery: This template
+  builds an AWS CodePipeline pipeline that implements a continuous delivery release
+  process for AWS CloudFormation stacks. Submit a CloudFormation source artifact
+  to an Amazon S3 location before building the pipeline. The pipeline uses the
+  artifact to automatically create stacks and change sets.
+
+Parameters:
+  PipelineName:
+    Description: A name for pipeline
+    Type: String
+  S3Bucket:
+    Description: The name of the S3 bucket that contains the source artifact, which must be in the same region as this stack
+    Type: String
+  SourceS3Key:
+    Default: BaseInstanceTemplates.zip
+    Description: The file name of the source artifact, such as myfolder/myartifact.zip
+    Type: String
+  TemplateFileName:
+    Default: BaseInstanceTemplate.yaml
+    Description: The file name of the CodePipeline Demo template
+    Type: String
+  TestStackName:
+    Default: Test-MyCodePipelineDemo
+    Description: A name for the test Base Instance stack
+    Type: String
+  TestStackConfig:
+    Default: test-stack-configuration.json
+    Description: The configuration file name for the test Base Instance stack
+    Type: String
+  ProdStackName:
+    Default: Prod-MyCodePipelineDemo
+    Description: A name for the production Base Instance stack
+    Type: String
+  ProdStackConfig:
+    Default: prod-stack-configuration.json
+    Description: The configuration file name for the production Base Instance stack
+    Type: String
+  ChangeSetName:
+    Default: UpdatePreview-CodePipelineDemo
+    Description: A name for the production Base Instance stack change set
+    Type: String
+  LambdaTemplateFileName:
+    Default: LambdaAppTest.yaml
+    Description: The file name of the CodePipeline Demo template
+    Type: String
+  TestStackLambdaConfig:
+    Default: test-stack-lambda-configuration.json
+    Description: The configuration file name for the test Base Instance stack
+    Type: String
+  Email:
+    Description: The email address where CodePipeline sends pipeline notifications
+    Type: String
+  GitHubRepo:
+    Description: The GitHub repository where you application is
+    Type: String
+    Default: sample-tomcat
+  GitHubBranch:
+    Description: The branch that you want your Pipeline to watch for changes
+    Type: String
+    Default: master
+  GitHubToken:
+    Description: GitHub Personal Access Token
+    Type: String
+  GitHubUser:
+    Description: Your GitHub UserName
+    Type: String
+  SlackNotifierLambdaKey:
+    Description: The Lambda function that does Slack notifications
+    Type: String
+    Default: Slack-notifier.zip
+  SlackWebHook:
+    Description: The Webhook created that notification will be sent to.
+    Type: String
+
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "CodePipeline Settings"
+        Parameters:
+          - PipelineName
+          - S3Bucket
+          - SourceS3Key
+          - Email
+          - GitHubRepo
+          - GitHubBranch
+          - GitHubToken
+          - GitHubUser
+      - Label:
+          default: "Test Stack Settings"
+        Parameters:
+          - TestStackName
+          - TemplateFileName
+          - TestStackConfig
+          - LambdaTemplateFileName
+          - TestStackLambdaConfig
+      - Label:
+          default: "Production Stack Settings"
+        Parameters:
+          - ChangeSetName
+          - ProdStackName
+          - ProdStackConfig
+
+Resources:
+  ArtifactStoreBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+
+  CodePipelineSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref Email
+          Protocol: email
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Ref 'ArtifactStoreBucket'
+        Type: S3
+      DisableInboundStageTransitions: []
+      Name: !Ref 'PipelineName'
+      RoleArn: !GetAtt [PipelineRole, Arn]
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: TemplateSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                S3Bucket: !Ref 'S3Bucket'
+                S3ObjectKey: !Ref 'SourceS3Key'
+              OutputArtifacts:
+                - Name: TemplateSource
+              RunOrder: '1'
+            - Name: App
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              Configuration:
+                Owner: !Ref GitHubUser
+                Repo: !Ref GitHubRepo
+                Branch: !Ref GitHubBranch
+                OAuthToken: !Ref GitHubToken
+              OutputArtifacts:
+                - Name: App
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: Build
+              InputArtifacts:
+                - Name: App
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: '1'
+                Provider: CodeBuild
+              OutputArtifacts:
+                - Name: MyAppBuild
+              Configuration:
+                ProjectName:
+                  !Ref CodeBuildJavaProject
+              RunOrder: 1
+        - Name: TestStage
+          Actions:
+            - Name: CreateStack
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: TemplateSource
+              Configuration:
+                ActionMode: REPLACE_ON_FAILURE
+                Capabilities: CAPABILITY_IAM
+                OutputFileName: TestStageOutput.json
+                RoleArn: !GetAtt [CFNRole, Arn]
+                StackName: !Ref TestStackName
+                TemplateConfiguration: !Sub TemplateSource::${TestStackConfig}
+                TemplatePath: !Sub TemplateSource::${TemplateFileName}
+              OutputArtifacts:
+                - Name: StagingStack
+              RunOrder: 1
+            - Name: StagingDeployLambda
+              InputArtifacts:
+                - Name: TemplateSource
+                - Name: StagingStack
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: '1'
+                Provider: CloudFormation
+              OutputArtifacts: []
+              Configuration:
+                StackName: StagingLambdaTest
+                ActionMode: REPLACE_ON_FAILURE
+                Capabilities: CAPABILITY_IAM
+                RoleArn: !GetAtt [CFNRole, Arn]
+                TemplateConfiguration: !Sub TemplateSource::${TestStackLambdaConfig}
+                TemplatePath: !Sub TemplateSource::${LambdaTemplateFileName}
+                ParameterOverrides: !Sub |
+                  {
+                    "PublicIp" : { "Fn::GetParam" : ["StagingStack", "TestStageOutput.json", "PublicIp"]}
+                  }
+              RunOrder: 2
+            - Name: DeployToStaging
+              InputArtifacts:
+                - Name: MyAppBuild
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: "1"
+                Provider: CodeDeploy
+              OutputArtifacts: []
+              Configuration:
+                ApplicationName: !Ref MyApplication
+                DeploymentGroupName: !Ref MyDeploymentGroupTest
+              RunOrder: 2
+            - Name: ExtSynthTest
+              InputArtifacts: []
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Version: '1'
+                Provider: Lambda
+              OutputArtifacts: []
+              Configuration:
+                FunctionName: DemoSampleTomcatTest
+              RunOrder: 3
+            - Name: StagingPassedSuccessfuly
+              InputArtifacts: []
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Version: '1'
+                Provider: Lambda
+              OutputArtifacts: []
+              Configuration:
+                FunctionName: !Ref SlackNotifier
+                UserParameters: !Sub |
+                  {
+                    "webhooks": "https://hooks.slack.com/services/${SlackWebHook}",
+                    "message": "Staging Passed Successfully"
+                  }
+              RunOrder: 4
+            - Name: ApproveTestStack
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                CustomData: !Sub 'Do you want to create a change set against the production stack and delete the ${TestStackName} stack?'
+              RunOrder: 5
+        - Name: ProdStage
+          Actions:
+            - Name: DeleteTestStack
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: DELETE_ONLY
+                RoleArn: !GetAtt [CFNRole, Arn]
+                StackName: !Ref TestStackName
+                Capabilities: CAPABILITY_IAM
+              RunOrder: 1
+            - Name: DeleteTestLambdaStack
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: DELETE_ONLY
+                RoleArn: !GetAtt [CFNRole, Arn]
+                StackName: StagingLambdaTest
+                Capabilities: CAPABILITY_IAM
+              RunOrder: 1
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              InputArtifacts:
+                - Name: TemplateSource
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                RoleArn: !GetAtt [CFNRole, Arn]
+                StackName: !Ref ProdStackName
+                Capabilities: CAPABILITY_IAM
+                ChangeSetName: !Ref ChangeSetName
+                TemplateConfiguration: !Sub "TemplateSource::${ProdStackConfig}"
+                TemplatePath: !Sub "TemplateSource::${TemplateFileName}"
+              RunOrder: '1'
+            - Name: ApproveChangeSet
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                NotificationArn: !Ref CodePipelineSNSTopic
+                CustomData: !Sub 'A new change set was created for the ${ProdStackName} stack. Do you want to implement the changes?'
+              RunOrder: '2'
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                Capabilities: CAPABILITY_IAM
+                ChangeSetName: !Ref ChangeSetName
+                RoleArn: !GetAtt [CFNRole, Arn]
+                StackName: !Ref ProdStackName
+              RunOrder: '3'
+            - Name: DeployToProd
+              InputArtifacts:
+                - Name: MyAppBuild
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: "1"
+                Provider: CodeDeploy
+              OutputArtifacts: []
+              Configuration:
+                ApplicationName: !Ref MyApplication
+                DeploymentGroupName: !Ref MyDeploymentGroupProd
+              RunOrder: 4
+
+  CodeBuildJavaProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn: CodeBuildRole
+    Properties:
+      Name:
+        !Ref AWS::StackName
+      Description: Build Java application
+      ServiceRole: !GetAtt [CodeBuildRole, Arn]
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: linuxContainer
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/java:openjdk-8
+      TimeoutInMinutes: 10
+      Tags:
+        - Key: Owner
+          Value: JavaTomcatProject
+      Source:
+        Type: CODEPIPELINE
+
+  MyApplication:
+    Type: AWS::CodeDeploy::Application
+
+  MyDeploymentGroupTest:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    DependsOn: MyApplication
+    Properties:
+      ApplicationName: !Ref MyApplication
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      Ec2TagFilters:
+        - Key: Name
+          Value: DemoSampleTomcatTest
+          Type: KEY_AND_VALUE
+      ServiceRoleArn: !GetAtt [CodeDeployTrustRole, Arn]
+
+  MyDeploymentGroupProd:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    DependsOn: MyApplication
+    Properties:
+      ApplicationName: !Ref MyApplication
+      DeploymentConfigName: CodeDeployDefault.OneAtATime
+      Ec2TagFilters:
+        - Key: Name
+          Value: DemoSampleTomcatProd
+          Type: KEY_AND_VALUE
+      ServiceRoleArn: !GetAtt [CodeDeployTrustRole, Arn]
+
+  CFNRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [cloudformation.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CloudFormationRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - 'ec2:*'
+                  - 'iam:*'
+                  - 's3:*'
+                  - 'codedeploy:*'
+                  - 'autoscaling:*'
+                  - 'cloudformation:*'
+                  - 'lambda:*'
+                Effect: Allow
+                Resource: '*'
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: ['sts:AssumeRole']
+          Effect: Allow
+          Principal:
+            Service: [codepipeline.amazonaws.com]
+        Version: '2012-10-17'
+      Path: /
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                - 's3:*'
+                - 'cloudformation:CreateStack'
+                - 'cloudformation:DescribeStacks'
+                - 'cloudformation:DeleteStack'
+                - 'cloudformation:UpdateStack'
+                - 'cloudformation:CreateChangeSet'
+                - 'cloudformation:ExecuteChangeSet'
+                - 'cloudformation:DeleteChangeSet'
+                - 'cloudformation:DescribeChangeSet'
+                - 'cloudformation:SetStackPolicy'
+                - 'iam:PassRole'
+                - 'iam:CreateRole'
+                - 'sns:Publish'
+                - 'codebuild:*'
+                - 'codedeploy:*'
+                - 'lambda:*'
+                Effect: Allow
+                Resource: '*'
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [codebuild.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: codebuild-service
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: "*"
+                Resource: "*"
+            Version: '2012-10-17'
+
+  CodeDeployTrustRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Sid: "1"
+            Effect: Allow
+            Principal:
+              Service:
+                - codedeploy.us-east-1.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+
+  CodeDeployRolePolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CodeDeployPolicy
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Resource: "*"
+            Action:
+              - ec2:Describe*
+          - Effect: Allow
+            Resource: "*"
+            Action:
+              - autoscaling:CompleteLifecycleAction
+              - autoscaling:DeleteLifecycleHook
+              - autoscaling:DescribeLifecycleHooks
+              - autoscaling:DescribeAutoScalingGroups
+              - autoscaling:PutLifecycleHook
+              - autoscaling:RecordLifecycleActionHeartbeat
+      Roles:
+        - !Ref CodeDeployTrustRole
+
+  SlackNotifier:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LambdaRole
+    Properties:
+      Handler: main.send_post
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 5
+      Runtime: python2.7
+      MemorySize: 128
+      Code:
+        S3Bucket: !Ref S3Bucket
+        S3Key: Slack-notifier.zip
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Path: /
+
+  LambdaRolePolicies:
+    Type: AWS::IAM::Policy
+    DependsOn: LambdaRole
+    Properties:
+      PolicyName: LambdaPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:*
+          - Effect: Allow
+            Action: ['ec2:Describe*']
+            Resource: "*"
+          - Effect: Allow
+            Action: 'logs:*'
+            Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+          - Effect: Allow
+            Action: 'sns:*'
+            Resource: ["*"]
+          - Effect: Allow
+            Action: 'codepipeline:*'
+            Resource: ["*"]
+      Roles: [ !Ref LambdaRole ]
